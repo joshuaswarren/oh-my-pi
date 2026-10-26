@@ -548,6 +548,41 @@ export const cfgFindEnabled = register({
 	},
 });
 
+/** Parses a find judge concurrency: a whole number ≥ 1, else `undefined`. */
+export function parseFindJudgeConcurrency(raw: string): number | undefined {
+	const text = raw.trim();
+	if (!/^\d+$/.test(text)) return undefined;
+	const value = Number(text);
+	return Number.isSafeInteger(value) && value >= 1 ? value : undefined;
+}
+
+export const cfgFindJudgeConcurrency = register({
+	id: "find.judgeConcurrency",
+	type: "number",
+	default: 16,
+	env: { name: "OMP_FIND_JUDGE_CONCURRENCY", parse: parseFindJudgeConcurrency },
+	validate: raw => {
+		if (raw === undefined) return;
+		if (typeof raw !== "number" || !Number.isSafeInteger(raw) || raw < 1) {
+			throw new Error("find.judgeConcurrency must be a whole number of at least 1");
+		}
+	},
+	ui: {
+		tab: "tools",
+		group: "Available Tools",
+		label: "Find Judge Concurrency",
+		description:
+			"Judge requests find keeps in flight per phase. Lower it for a judge that serves one request at a time, such as a local OpenJev",
+		options: [
+			{ value: "1", label: "1", description: "One request at a time" },
+			{ value: "2", label: "2" },
+			{ value: "4", label: "4" },
+			{ value: "8", label: "8" },
+			{ value: "16", label: "16", description: "Default" },
+		],
+	},
+});
+
 // Optional tools
 
 export const cfgDebugEnabled = register({

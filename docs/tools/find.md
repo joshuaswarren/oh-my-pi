@@ -53,7 +53,7 @@ Use `find` first when the implementing location is unknown. Use `grep` for known
 3. **Passage scoring.** Twenty files are read (the two strongest lexical candidates unconditionally, the rest by name score then lexical rank): up to 4 MB each, cut into 8 KB whole-line windows tagged `L<n>| `, keeping the 24 best-scoring windows (spread evenly through the file when no keyword matches). Each window becomes a 384-byte sketch of its most keyword-dense verbatim lines; sketches are packed 46 per request across files and judged.
 4. **Verification.** Sketches scoring ≥ 0.45 (at most 40) are verified as complete passages, grouped per file three to a request. Only verified passages produce ranges; positive ranges (≥ τ = 0.20) that touch or overlap are merged, keeping the max probability. A file is a hit when its best verified passage reaches τ.
 
-Each judged phase drains through a dispatcher with 16 requests in flight before the next begins, so the critical path is three dependent waves.
+Each judged phase drains through a dispatcher with 16 requests in flight (`find.judgeConcurrency`, or `OMP_FIND_JUDGE_CONCURRENCY`, which wins over config) before the next begins, so the critical path is three dependent waves. Lower it for a judge that serves one request at a time, such as a local OpenJev on its MLX backend, so requests do not queue past their timeouts.
 
 ## Side Effects
 - Filesystem: reads up to 20 candidate files (4 MB each); never writes.

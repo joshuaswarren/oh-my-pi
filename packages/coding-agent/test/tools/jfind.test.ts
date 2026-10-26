@@ -20,6 +20,7 @@ import {
 	windows,
 } from "@oh-my-pi/pi-coding-agent/tools/jfind/passages";
 import { readText, ReadTextError } from "@oh-my-pi/pi-coding-agent/tools/jfind/text";
+import { cfgFindJudgeConcurrency } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import { eligibleFile, renderTree, resolveSearchRoot } from "@oh-my-pi/pi-coding-agent/tools/jfind/tree";
 import { resolveSearchResultPath } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
@@ -278,6 +279,38 @@ describe("jfind cascade", () => {
 		}
 	});
 
+	it("keeps at most `parallel` judge requests in flight per phase", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jfind-cascade-parallel-"));
+		try {
+			// 200 files: two filename batches, then many sketch and verification requests.
+			for (let i = 0; i < 200; i++) {
+				await Bun.write(path.join(dir, `retry${i}.ts`), `export function retry${i}() { return ${i}; } // retry\n`);
+			}
+			const peakWith = async (parallel: number | undefined) => {
+				const judge = new FakeJudge(() => 0.9);
+				const result = await runCascade({
+					root: { path: dir, type: "directory" },
+					filesystem: urlFs(dir),
+					query: "retry",
+					extraKeywords: [],
+					judge,
+					includeHidden: false,
+					parallel,
+				});
+				expect(result.coverage).toBe("complete");
+				expect(judge.requests.length).toBeGreaterThan(3);
+				return judge.peak;
+			};
+			// A single-lane judge (e.g. a local OpenJev) must never see a second queued request.
+			expect(await peakWith(1)).toBe(1);
+			expect(await peakWith(3)).toBe(3);
+			// Unset keeps the upstream fan-out.
+			expect(await peakWith(undefined)).toBeGreaterThan(3);
+		} finally {
+			await removeWithRetries(dir);
+		}
+	});
+
 	it("routes sketches onward when their judgment fails and reports the failure", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "jfind-cascade-fail-"));
 		try {
@@ -478,6 +511,36 @@ describe("jfind cascade", () => {
 			).rejects.toThrow("Operation aborted");
 		} finally {
 			await removeWithRetries(dir);
+		}
+	});
+});
+
+describe("find.judgeConcurrency", () => {
+	const original = Bun.env.OMP_FIND_JUDGE_CONCURRENCY;
+
+	afterEach(() => {
+		if (original === undefined) delete Bun.env.OMP_FIND_JUDGE_CONCURRENCY;
+		else Bun.env.OMP_FIND_JUDGE_CONCURRENCY = original;
+	});
+
+	it("defaults to 16, reads config, and lets a valid OMP_FIND_JUDGE_CONCURRENCY win", () => {
+		delete Bun.env.OMP_FIND_JUDGE_CONCURRENCY;
+		expect(cfgFindJudgeConcurrency.get(Settings.isolated({}))).toBe(16);
+		expect(cfgFindJudgeConcurrency.get(Settings.isolated({ "find.judgeConcurrency": 4 }))).toBe(4);
+		Bun.env.OMP_FIND_JUDGE_CONCURRENCY = "2";
+		expect(cfgFindJudgeConcurrency.get(Settings.isolated({ "find.judgeConcurrency": 4 }))).toBe(2);
+		// Text that is not a whole number >= 1 is ignored rather than stalling or flooding the judge.
+		for (const bad of ["0", "-3", "2.5", "lots", ""]) {
+			Bun.env.OMP_FIND_JUDGE_CONCURRENCY = bad;
+			expect(cfgFindJudgeConcurrency.get(Settings.isolated({ "find.judgeConcurrency": 4 }))).toBe(4);
+		}
+	});
+
+	it("rejects a configured value that is not a whole number of at least 1", () => {
+		for (const bad of [0, -1, 2.5]) {
+			expect(() => Settings.isolated({ "find.judgeConcurrency": bad })).toThrow(
+				"find.judgeConcurrency must be a whole number of at least 1",
+			);
 		}
 	});
 });

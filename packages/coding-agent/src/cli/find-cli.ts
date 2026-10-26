@@ -11,6 +11,7 @@ import { formatPathRelativeToCwd, resolveSearchResultPath } from "../tools/path-
 import { type CascadeResult, runCascade } from "../tools/jfind/cascade";
 import { rankedHeat } from "../tools/jfind/passages";
 import { resolveSearchRoot, type SearchRoot } from "../tools/jfind/tree";
+import { cfgFindJudgeConcurrency } from "../tools/settings";
 
 export interface FindCommandArgs {
 	query: string;
@@ -99,7 +100,7 @@ export async function runFindCommand(cmd: FindCommandArgs): Promise<void> {
 	// scope has none of its own, so it keeps the caller's.
 	const baseCwd = root.type === "directory" && !isUrlPath(root.path) ? root.path : cwd;
 	log("resolving judge");
-	const { judge, close } = await openStandaloneJudge(baseCwd, "find");
+	const { judge, settings, close } = await openStandaloneJudge(baseCwd, "find");
 	try {
 		const started = performance.now();
 		const raw = await runCascade({
@@ -109,6 +110,7 @@ export async function runFindCommand(cmd: FindCommandArgs): Promise<void> {
 			extraKeywords: cmd.keywords,
 			judge,
 			includeHidden: cmd.hidden,
+			parallel: cfgFindJudgeConcurrency.get(settings),
 			onProgress: log,
 		});
 		// Hits print as paths usable from the caller's cwd: relative files or URLs.

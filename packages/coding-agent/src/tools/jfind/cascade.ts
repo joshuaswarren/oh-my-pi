@@ -24,7 +24,7 @@ import { nameBatch, passageBatch, passageKey, entryKey, type Request, type Sketc
 import { lines, readText, ReadTextError, takeChars } from "./text";
 import { type FileEntry, listFiles, type SearchRoot } from "./tree";
 
-/** Requests in flight per dispatched phase. */
+/** Requests in flight per dispatched phase when the caller does not set {@link CascadeOptions.parallel}. */
 const PARALLEL = 16;
 /** Files per filename-ranking request. */
 const NAME_BATCH = 64;
@@ -66,6 +66,8 @@ export interface CascadeOptions {
 	extraKeywords: readonly string[];
 	judge: Judge;
 	includeHidden: boolean;
+	/** Judge requests in flight per dispatched phase (`find.judgeConcurrency`); defaults to 16. */
+	parallel?: number;
 	signal?: AbortSignal;
 	onProgress?: (message: string) => void;
 }
@@ -158,7 +160,7 @@ class Cascade {
 	}
 
 	/**
-	 * Run every job with at most {@link PARALLEL} requests in flight, handing each
+	 * Run every job with at most `parallel` requests in flight, handing each
 	 * outcome to `settle` in completion order. Resolves once the queue drains.
 	 */
 	async #dispatch<J extends { request: Request }>(jobs: readonly J[], settle: (job: J, outcome: Outcome) => void) {
@@ -170,7 +172,8 @@ class Cascade {
 				settle(job, await this.#ask(job.request));
 			}
 		};
-		await Promise.all(Array.from({ length: Math.min(PARALLEL, jobs.length) }, worker));
+		const parallel = Math.max(1, Math.floor(this.#options.parallel ?? PARALLEL));
+		await Promise.all(Array.from({ length: Math.min(parallel, jobs.length) }, worker));
 	}
 
 	async run(): Promise<CascadeResult> {

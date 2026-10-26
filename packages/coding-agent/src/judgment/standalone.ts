@@ -10,6 +10,8 @@ import { type ChainJudge, resolveJudge, sharedJudgmentCache } from ".";
 
 export interface StandaloneJudge {
 	judge: ChainJudge;
+	/** Project settings the judge was resolved from. */
+	settings: Settings;
 	/** Release the auth store; the judge must not be used afterwards. */
 	close(): void;
 }
@@ -27,6 +29,7 @@ export async function openStandaloneJudge(cwd: string, purpose: string): Promise
 		await registry.refresh();
 		await loadCliExtensionProviders(registry, settings, cwd);
 		return {
+			settings,
 			judge: resolveJudge({
 				settings,
 				registry,

@@ -28,7 +28,7 @@ import { type CascadeResult, runCascade } from "./cascade";
 import { rankedHeat } from "./passages";
 import { resolveSearchRoot } from "./tree";
 
-import { cfgFindEnabled } from "../settings";
+import { cfgFindEnabled, cfgFindJudgeConcurrency } from "../settings";
 
 const findSchema = type({
 	query: "string",
@@ -118,6 +118,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 				extraKeywords: params.grep_keywords,
 				judge,
 				includeHidden: false,
+				parallel: cfgFindJudgeConcurrency.get(this.session.settings),
 				signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
 				onProgress: message => onUpdate?.({ content: [{ type: "text", text: message }] }),
 			});
