@@ -306,6 +306,8 @@ export class AdvisorRuntime {
 	#iterationAbort: AbortController | undefined;
 	#backlog = 0;
 	#consecutiveFailures = 0;
+	/** Rate-limit (HTTP 429) answers in a row: they back the retry off, and are not strikes. */
+	#rateLimitStreak = 0;
 	#failureNotified = false;
 	/** Consecutive quarantined turns since the last success/reset (issue #6661). */
 	#consecutiveQuarantines = 0;
@@ -572,6 +574,7 @@ export class AdvisorRuntime {
 		this.#held = [];
 		this.#backlog = 0;
 		this.#consecutiveFailures = 0;
+		this.#rateLimitStreak = 0;
 		this.#failureNotified = false;
 		this.#advisorRegexSecretValues.clear();
 		this.#wakeAllWaiters();
@@ -591,6 +594,7 @@ export class AdvisorRuntime {
 
 	#clearAdvisorContextAtCurrentCursor(): void {
 		this.#consecutiveFailures = 0;
+		this.#rateLimitStreak = 0;
 		this.#clearSeenContext();
 		try {
 			this.agent.reset();
@@ -712,6 +716,7 @@ export class AdvisorRuntime {
 		this.#held = [];
 		this.#backlog = 0;
 		this.#consecutiveFailures = 0;
+		this.#rateLimitStreak = 0;
 		this.#failing = false;
 		this.#droppedBacklogs = 0;
 		this.#failureNotified = false;
@@ -1188,7 +1193,11 @@ export class AdvisorRuntime {
 						pending: this.#pending.length,
 						backlog: this.#backlog,
 					});
+					// A maintenance re-prime is not a recovery: keep the batch's strikes, or a batch that keeps
+					// failing and keeps triggering maintenance is retried without end instead of being dropped.
+					const strikes = this.#consecutiveFailures;
 					this.#clearAdvisorContextAtCurrentCursor();
+					this.#consecutiveFailures = strikes;
 					const preparedMessages = this.#prepareBatch(rawMessages);
 					return {
 						batchText,
@@ -1394,6 +1403,7 @@ export class AdvisorRuntime {
 					this.#hasReviewed = true;
 					this.#failing = false;
 					this.#consecutiveFailures = 0;
+					this.#rateLimitStreak = 0;
 					this.#failureNotified = false;
 					this.#droppedBacklogs = 0;
 					this.#consecutiveQuarantines = 0;
@@ -1494,6 +1504,7 @@ export class AdvisorRuntime {
 						}
 						if (refusalRecovered) {
 							this.#consecutiveFailures = 0;
+							this.#rateLimitStreak = 0;
 							this.#failureNotified = false;
 							this.#pending.unshift({
 								text: batch(),
@@ -1556,6 +1567,7 @@ export class AdvisorRuntime {
 					if (this.#epoch !== epoch) continue;
 					if (recovered) {
 						this.#consecutiveFailures = 0;
+						this.#rateLimitStreak = 0;
 						this.#failureNotified = false;
 						this.#pending.unshift({
 							text: batch(),
@@ -1575,6 +1587,7 @@ export class AdvisorRuntime {
 						logger.warn("advisor quota exhausted", { err: String(err) });
 						this.#quotaExhausted = true;
 						this.#consecutiveFailures = 0;
+						this.#rateLimitStreak = 0;
 						this.#failureNotified = false;
 						// Render before clearing: the requeued text must be obfuscated
 						// against the full advisor value set this batch was prepared under.
@@ -1601,6 +1614,7 @@ export class AdvisorRuntime {
 						this.#notifyFailureOnce(err);
 						this.#notifyTurnAbandoned();
 						this.#consecutiveFailures = 0;
+						this.#rateLimitStreak = 0;
 						// The dropped batch may carry primary-context we never delivered; drop
 						// the seen-state too so queued raw deltas re-expand before delivery.
 						this.#clearSeenContext();
@@ -1634,12 +1648,18 @@ export class AdvisorRuntime {
 							logger.debug("advisor context overflow recovered at current primary cursor");
 						}
 					} else {
-						this.#consecutiveFailures++;
-						if (this.#consecutiveFailures >= 3) {
+						// A rate-limit answer ("busy, try later") is not a failed advisor: it backs off
+						// (doubling, jittered, capped) and keeps the batch instead of burning strikes
+						// and dropping the backlog, so a shared limit-1 key is not hammered once a second.
+						const rateLimited = isRateLimitFailure(err);
+						if (rateLimited) this.#rateLimitStreak++;
+						else this.#consecutiveFailures++;
+						if (rateLimited ? this.#rateLimitStreak >= MAX_RATE_LIMIT_STREAK : this.#consecutiveFailures >= 3) {
 							logger.warn("advisor failed consecutively 3 times; dropping backlog to prevent stall");
 							this.#notifyFailureOnce(err);
 							this.#notifyTurnAbandoned();
 							this.#consecutiveFailures = 0;
+							this.#rateLimitStreak = 0;
 							// The dropped batch may carry primary-context we never delivered; drop
 							// the seen-state too so queued raw deltas re-expand before delivery.
 							this.#clearSeenContext();
@@ -1654,11 +1674,12 @@ export class AdvisorRuntime {
 								wip,
 								overflowRecovery: recoveringOverflow || undefined,
 							});
-							if (this.retryDelayMs <= 0) {
+							const delayMs = rateLimited ? rateLimitRetryDelayMs(this.retryDelayMs, this.#rateLimitStreak) : this.retryDelayMs;
+							if (delayMs <= 0) {
 								await Bun.sleep(0);
 							} else {
 								try {
-									await raceWithSignal(Bun.sleep(this.retryDelayMs), iterationAbort.signal);
+									await raceWithSignal(Bun.sleep(delayMs), iterationAbort.signal);
 								} catch (sleepError) {
 									if (!iterationAbort.signal.aborted) throw sleepError;
 								}
@@ -1896,4 +1917,22 @@ function scrubAdvisorHistory(
 		if (next !== message) messages[index] = next;
 	}
 	return sharedRegexSecretValues.size !== previousSize;
+}
+
+const RATE_LIMIT_REASONS = new Set(["RATE_LIMIT_EXCEEDED", "CONCURRENT_LIMIT"]);
+/** After this many rate-limit answers in a row (about two minutes of backoff) the batch is dropped like any other failure. */
+const MAX_RATE_LIMIT_STREAK = 8;
+const RATE_LIMIT_DELAY_CAP_MS = 60_000;
+
+/** True when a failed advisor turn was a provider "too many requests / busy" answer, not a broken advisor. */
+export function isRateLimitFailure(err: unknown): boolean {
+	const text = err instanceof Error ? err.message : String(err);
+	return RATE_LIMIT_REASONS.has(AIError.parseRateLimitReason(text));
+}
+
+/** Delay before the next try after `streak` rate-limit answers in a row: base, 2x, 4x ... capped, with +-50% jitter. A base of 0 means no delay. */
+export function rateLimitRetryDelayMs(baseMs: number, streak: number, random: () => number = Math.random): number {
+	if (baseMs <= 0) return 0;
+	const exp = Math.min(RATE_LIMIT_DELAY_CAP_MS, baseMs * 2 ** Math.max(0, streak - 1));
+	return Math.round(exp * (0.5 + random()));
 }
